@@ -5,9 +5,9 @@
 #include "AuthLX/skCrypter.h"
 #include <algorithm>
 
-std::string name = skCrypt("internal").decrypt();
-std::string ownerid = skCrypt("2ec0f300-440e-4ee1-b23d-417b7da88f8e").decrypt();
-std::string secret = skCrypt("3b147f4218ea765e4e3496efd3ffdbf1046c81909813df0786e642e8d2a39ed5").decrypt();
+std::string name = skCrypt("your_application_name").decrypt();
+std::string ownerid = skCrypt("your_application_owner_id_from_dashboard").decrypt();
+std::string secret = skCrypt("your_application_secret_key_from_dashboard").decrypt();
 std::string version = skCrypt("1.0").decrypt();
 std::string url = skCrypt("https://authlx.com/api/v1/client/").decrypt();
 
