@@ -1,3 +1,4 @@
+#include <Windows.h>
 #include "AuthLX/authlx.hpp"
 #include <iostream>
 #include <string>
@@ -284,6 +285,10 @@ void example_account_details(AuthLX::Api& authlxapp) {
 }
 
 int main() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     std::cout << "Initialising AuthLX security..." << std::endl;
     
     AuthLX::Api authlxapp(

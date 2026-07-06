@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36811.4 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Project1", "Project1\Project1.vcxproj", "{A180627B-0054-4B01-91AD-FB87C3919947}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AuthLX-CPP-Example", "AuthLX-CPP-Example\AuthLX-CPP-Example.vcxproj", "{A180627B-0054-4B01-91AD-FB87C3919947}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

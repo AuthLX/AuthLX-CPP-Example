@@ -1,4 +1,5 @@
 #include "authlx.hpp"
+#include "Logger.hpp"
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
@@ -230,40 +231,42 @@ namespace AuthLX {
             std::string server_name = app_info.value("name", name);
 
             if (server_name != name) {
-                std::cerr << "\n[SECURITY] Application name mismatch!" << std::endl;
-                std::cerr << "  Expected: " << name << "  |  Server reports: " << server_name << std::endl;
-                std::cerr << "  Exiting to prevent unauthorized execution." << std::endl;
-                Sleep(3000);
-                ExitProcess(1);
+                LOG_ERROR("[SECURITY] Application name mismatch! Expected: " << name << " | Server reports: " << server_name);
+                last_message = "Application name mismatch! Expected: " + name + " | Server reports: " + server_name;
+                initialized = false;
+                return;
             }
 
             if (server_version != version) {
-                std::cerr << "\n[UPDATE REQUIRED] Application version is outdated!" << std::endl;
-                std::cerr << "  Current: " << version << "  |  Required: " << server_version << std::endl;
+                LOG_ERROR("[UPDATE REQUIRED] Application version is outdated! Current: " << version << " | Required: " << server_version);
+                last_message = "Application version is outdated! Current: " + version + " | Required: " + server_version;
                 std::string auto_update = app_info.value("auto_update_link", "");
                 std::string webloader = app_info.value("webloader_link", "");
                 if (!auto_update.empty()) {
-                    std::cerr << "  Download: " << auto_update << std::endl;
+                    LOG_INFO("Download auto-update: " << auto_update);
                 }
                 if (!webloader.empty()) {
-                    std::cerr << "  Webloader: " << webloader << std::endl;
+                    LOG_INFO("Webloader link: " << webloader);
                 }
-                Sleep(3000);
-                ExitProcess(1);
+                initialized = false;
+                return;
             }
 
             initialized = true;
             hwid_method = app_info.value("hwid_method", "windows_user");
 
+            LOG_INFO("SDK Initialized successfully. Name: " << name << ", Version: " << version << ", HWID Method: " << hwid_method);
             if (debug) {
-                std::cout << "[DEBUG] Hash mode: " << (client_secret.empty() ? "OFF" : "SECURE") << std::endl;
+                LOG_DEBUG("Hash mode: " << (client_secret.empty() ? "OFF" : "SECURE"));
             }
         } else {
             std::string err_msg = "Failed to initialise. Check ownerid and network connectivity.";
             if (!response.is_null() && response.contains("message")) {
                 err_msg = response.value("message", "");
             }
-            fatal_error(err_msg);
+            LOG_ERROR("Initialization failed: " << err_msg);
+            last_message = err_msg;
+            initialized = false;
         }
     }
 
@@ -296,7 +299,7 @@ namespace AuthLX {
     // ─── Authentication ──────────────────────────────────────────────────────
 
     bool Api::login(std::string user, std::string password, std::string hwid) {
-        checkinit();
+        if (!checkinit()) return false;
 
         if (hwid.empty()) {
             hwid = Others::get_hwid(hwid_method);
@@ -347,7 +350,7 @@ namespace AuthLX {
     }
 
     bool Api::registerAccount(std::string user, std::string email, std::string password, std::string license_key, std::string hwid) {
-        checkinit();
+        if (!checkinit()) return false;
 
         if (hwid.empty()) {
             hwid = Others::get_hwid(hwid_method);
@@ -382,7 +385,7 @@ namespace AuthLX {
     }
 
     bool Api::webLogin(std::string user, std::string password) {
-        checkinit();
+        if (!checkinit()) return false;
 
         if (lockout_active()) {
             long long secs = lockout_remaining_ms() / 1000;
@@ -429,7 +432,7 @@ namespace AuthLX {
     }
 
     bool Api::logout() {
-        checkinit();
+        if (!checkinit()) return false;
         if (session_token.empty()) {
             std::cerr << "Not logged in." << std::endl;
             return false;
@@ -457,7 +460,7 @@ namespace AuthLX {
     // ─── License operations ──────────────────────────────────────────────────
 
     bool Api::upgrade(std::string user, std::string license_key) {
-        checkinit();
+        if (!checkinit()) return false;
 
         nlohmann::json payload = {
             {"app_id", ownerid},
@@ -481,7 +484,7 @@ namespace AuthLX {
     // ─── Verification ────────────────────────────────────────────────────────
 
     bool Api::check() {
-        checkinit();
+        if (!checkinit()) return false;
         if (session_token.empty()) {
             return false;
         }
@@ -496,7 +499,7 @@ namespace AuthLX {
     }
 
     bool Api::verifyToken(std::string standalone_token) {
-        checkinit();
+        if (!checkinit()) return false;
 
         nlohmann::json payload = {
             {"app_id", ownerid},
@@ -519,7 +522,7 @@ namespace AuthLX {
     // ─── Account management ──────────────────────────────────────────────────
 
     bool Api::changeUsername(std::string new_username) {
-        checkinit();
+        if (!checkinit()) return false;
         if (session_token.empty()) {
             std::cerr << "Must be logged in to change username." << std::endl;
             return false;
@@ -545,7 +548,7 @@ namespace AuthLX {
     }
 
     bool Api::forgot(std::string user, std::string new_password, std::string hwid) {
-        checkinit();
+        if (!checkinit()) return false;
         if (hwid.empty()) {
             hwid = Others::get_hwid(hwid_method);
         }
@@ -816,12 +819,12 @@ namespace AuthLX {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    void Api::checkinit() {
+    bool Api::checkinit() {
         if (!initialized) {
-            std::cerr << "SDK not initialised. Call api() first." << std::endl;
-            Sleep(3000);
-            ExitProcess(1);
+            LOG_ERROR("SDK not initialised. Ensure API constructor completes successfully.");
+            return false;
         }
+        return true;
     }
 
     nlohmann::json Api::do_request(std::string endpoint, nlohmann::json post_data) {
@@ -839,17 +842,17 @@ namespace AuthLX {
         if (!allowed_hosts.empty()) {
             std::string check_domain = to_string(host);
             if (std::find(allowed_hosts.begin(), allowed_hosts.end(), check_domain) == allowed_hosts.end()) {
-                std::cerr << "Security violation: blocked connection to " << check_domain << std::endl;
-                Sleep(3000);
-                ExitProcess(1);
+                LOG_ERROR("Security violation: blocked connection to " << check_domain);
+                last_message = "Security violation: blocked connection to " + check_domain;
+                return nullptr;
             }
         }
 
         HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
         if (!hConnect) {
-            std::cerr << "Connection error. Server is unreachable." << std::endl;
-            Sleep(3000);
-            ExitProcess(1);
+            LOG_ERROR("Connection error. Server is unreachable.");
+            last_message = "Connection error. Server is unreachable.";
+            return nullptr;
         }
 
         HINTERNET hRequest = WinHttpOpenRequest(
@@ -864,9 +867,9 @@ namespace AuthLX {
 
         if (!hRequest) {
             WinHttpCloseHandle(hConnect);
-            std::cerr << "Request initialization failed." << std::endl;
-            Sleep(3000);
-            ExitProcess(1);
+            LOG_ERROR("Request initialization failed.");
+            last_message = "Request initialization failed.";
+            return nullptr;
         }
 
         // Set User-Agent and content-type headers
@@ -879,7 +882,7 @@ namespace AuthLX {
             if (safe_data.contains("password")) {
                 safe_data["password"] = "***";
             }
-            std::cout << "→ POST " << endpoint << " " << safe_data.dump() << std::endl;
+            LOG_DEBUG("→ POST " << endpoint << " " << safe_data.dump());
         }
 
         BOOL bResults = WinHttpSendRequest(
@@ -898,7 +901,9 @@ namespace AuthLX {
             DWORD err = GetLastError();
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
-            fatal_error("Request timed out or network error. Please check your internet connection. (Error: " + std::to_string(err) + ")");
+            LOG_ERROR("Request timed out or network error (Error: " << err << ")");
+            last_message = "Request timed out or network error (Error: " + std::to_string(err) + ")";
+            return nullptr;
         }
 
         nlohmann::json response_json = nullptr;
@@ -923,16 +928,21 @@ namespace AuthLX {
             if (!response_data.empty()) {
                 std::string resp_str(response_data.begin(), response_data.end());
                 if (debug) {
-                    std::cout << "← " << resp_str.substr(0, 200) << std::endl;
+                    LOG_DEBUG("← " << resp_str.substr(0, 200));
                 }
                 try {
                     response_json = nlohmann::json::parse(resp_str);
-                } catch (const std::exception&) {
+                } catch (const std::exception& e) {
                     WinHttpCloseHandle(hRequest);
                     WinHttpCloseHandle(hConnect);
-                    fatal_error("Invalid JSON response from server. Server might be offline or undergoing maintenance.\nRaw response: " + resp_str);
+                    LOG_ERROR("Invalid JSON response from server. Error: " << e.what() << "\nRaw response: " << resp_str);
+                    last_message = "Invalid response from server.";
+                    return nullptr;
                 }
             }
+        } else {
+            LOG_ERROR("Response reception timed out.");
+            last_message = "Response reception timed out.";
         }
 
         WinHttpCloseHandle(hRequest);
@@ -1051,14 +1061,14 @@ namespace AuthLX {
 
     void Others::anti_debug() {
         if (IsDebuggerPresent()) {
-            std::cerr << "Security violation: Debugger detected. Exiting." << std::endl;
+            LOG_ERROR("Security violation: Debugger detected. Exiting.");
             ExitProcess(1);
         }
 
         BOOL isDebuggerAttached = FALSE;
         if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &isDebuggerAttached)) {
             if (isDebuggerAttached) {
-                std::cerr << "Security violation: Remote debugger detected. Exiting." << std::endl;
+                LOG_ERROR("Security violation: Remote debugger detected. Exiting.");
                 ExitProcess(1);
             }
         }

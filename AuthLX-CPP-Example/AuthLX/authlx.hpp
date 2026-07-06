@@ -44,6 +44,7 @@ namespace AuthLX {
 
         std::string ban_reason;
         std::string ban_revoke_date;
+        std::string last_message;
 
         // Secure String fields (from method1/method2 templates)
         bool secure_strings_enabled = false;
@@ -127,7 +128,7 @@ namespace AuthLX {
         std::thread ban_monitor_thread;
         std::atomic<bool> ban_monitor_active{false};
 
-        void checkinit();
+        bool checkinit();
         nlohmann::json do_request(std::string endpoint, nlohmann::json post_data);
         void load_user_data(nlohmann::json data);
         void parse_ban_info(std::string msg);
