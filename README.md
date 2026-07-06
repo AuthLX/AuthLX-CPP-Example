@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE.txt)
 [![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg?style=flat-square)](#)
 
-A professional C++ reference implementation demonstrating integration with **AuthLX**, a premium authentication, licensing, and security platform. This repository contains both a console-based SDK wrapper and a complete windowed DirectX 11 + ImGui application demonstrating production-ready integration patterns, anti-reverse engineering techniques, secure cryptography, and structured logging.
+A professional C++ reference implementation demonstrating integration with **[AuthLX](https://authlx.com)**, a premium authentication, licensing, and security platform. This repository contains both a console-based SDK wrapper and a complete windowed DirectX 11 + ImGui application demonstrating production-ready integration patterns, anti-reverse engineering techniques, secure cryptography, and structured logging.
 
 ---
 
