@@ -66,6 +66,7 @@ std::string menu_main() {
     std::cout << "  [6]  Verify Standalone API Token" << std::endl;
     std::cout << "  [7]  Show HWID methods" << std::endl;
     std::cout << "  [8]  Debug Info" << std::endl;
+    std::cout << "  [9]  Check & Install Updates" << std::endl;
     std::cout << "  [0]  Exit" << std::endl;
     return get_input("\n  › ");
 }
@@ -284,6 +285,28 @@ void example_account_details(AuthLX::Api& authlxapp) {
     }
 }
 
+void example_check_updates(AuthLX::Api& authlxapp) {
+    std::cout << "\n── CHECK & INSTALL UPDATES ─────────────────────────────" << std::endl;
+    std::cout << "  Current Version : " << authlxapp.version << std::endl;
+    std::cout << "  Checking server for latest release..." << std::endl;
+
+    AuthLX::UpdateInfo info = authlxapp.check_for_updates();
+    std::cout << "  Latest Version  : " << (info.latest_version.empty() ? "Unknown" : info.latest_version) << std::endl;
+
+    if (info.update_available) {
+        std::cout << "  ✓ Update Available! (v" << info.current_version << " → v" << info.latest_version << ")" << std::endl;
+        std::cout << "  Download URL    : " << info.download_url << std::endl;
+        std::string choice = get_input("\n  Install update now? (y/N): ");
+        if (choice == "y" || choice == "Y") {
+            authlxapp.perform_update(info);
+        } else {
+            std::cout << "  Update deferred by user." << std::endl;
+        }
+    } else {
+        std::cout << "  ✓ You are running the latest version." << std::endl;
+    }
+}
+
 int main() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -359,6 +382,8 @@ int main() {
                 example_hwid(authlxapp);
             } else if (choice == "8") {
                 example_debug_info(authlxapp);
+            } else if (choice == "9") {
+                example_check_updates(authlxapp);
             } else if (choice == "0") {
                 std::cout << "\nGoodbye." << std::endl;
                 break;

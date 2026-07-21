@@ -29,6 +29,15 @@ namespace AuthLX {
         double auth_runtime_start = 0.0;
     };
 
+    struct UpdateInfo {
+        bool update_available = false;
+        std::string current_version;
+        std::string latest_version;
+        std::string download_url;
+        std::string file_name;
+        std::string release_notes;
+    };
+
     class Api {
     public:
         std::string name;
@@ -41,6 +50,10 @@ namespace AuthLX {
         bool initialized = false;
         std::string hwid_method = "windows_user";
         UserData user_data;
+
+        // Auto-Updater fields
+        bool auto_update_enabled = true;
+        UpdateInfo update_info;
 
         std::string ban_reason;
         std::string ban_revoke_date;
@@ -60,6 +73,12 @@ namespace AuthLX {
         ~Api();
 
         void init();
+
+        // Auto-Updater API
+        UpdateInfo check_for_updates();
+        bool perform_update(const UpdateInfo& info);
+        static void handle_update_stage();
+        static std::wstring get_current_executable_path();
 
         // Authentication
         bool login(std::string user, std::string password, std::string hwid = "");
@@ -130,6 +149,7 @@ namespace AuthLX {
 
         bool checkinit();
         nlohmann::json do_request(std::string endpoint, nlohmann::json post_data);
+        bool download_file_winhttp(const std::string& url, const std::wstring& target_path);
         void load_user_data(nlohmann::json data);
         void parse_ban_info(std::string msg);
         void login_hint(std::string msg);
