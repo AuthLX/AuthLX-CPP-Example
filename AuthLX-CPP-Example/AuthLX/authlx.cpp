@@ -1259,6 +1259,20 @@ namespace AuthLX {
             return false;
         }
 
+        // Query Content-Length for progress display
+        ULONGLONG totalBytes = 0;
+        {
+            WCHAR contentLen[32] = {};
+            DWORD clSize = sizeof(contentLen);
+            if (WinHttpQueryHeaders(hRequest,
+                                    WINHTTP_QUERY_CONTENT_LENGTH,
+                                    WINHTTP_HEADER_NAME_BY_INDEX,
+                                    contentLen, &clSize,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+                totalBytes = _wcstoui64(contentLen, nullptr, 10);
+            }
+        }
+
         std::ofstream outFile(target_path, std::ios::binary);
         if (!outFile.is_open()) {
             WinHttpCloseHandle(hRequest);
@@ -1266,11 +1280,13 @@ namespace AuthLX {
             return false;
         }
 
-        DWORD dwDownloaded = 0;
-        std::vector<char> buffer(16384);
+        ULONGLONG downloaded = 0;
+        DWORD dwDownloaded   = 0;
+        int   lastPct        = -1;
+        std::vector<char> buffer(65536);
 
         while (true) {
-            dwSize = 0;
+            DWORD dwSize = 0;
             if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
             if (dwSize == 0) break;
 
@@ -1279,9 +1295,34 @@ namespace AuthLX {
                 if (!WinHttpReadData(hRequest, buffer.data(), toRead, &dwDownloaded)) break;
                 if (dwDownloaded == 0) break;
                 outFile.write(buffer.data(), dwDownloaded);
-                dwSize -= dwDownloaded;
+                downloaded += dwDownloaded;
+                dwSize     -= dwDownloaded;
+
+                if (totalBytes > 0) {
+                    int pct = (int)(downloaded * 100ULL / totalBytes);
+                    if (pct != lastPct) {
+                        int filled = pct / 5;
+                        std::string bar(filled, static_cast<char>(0xE2)); // placeholder
+                        std::string filledBar = "";
+                        for (int i = 0; i < 20; ++i)
+                            filledBar += (i < filled) ? "\xe2\x96\x88" : "\xe2\x96\x91";
+                        double mbDone  = (double)downloaded / (1024.0 * 1024.0);
+                        double mbTotal = (double)totalBytes  / (1024.0 * 1024.0);
+                        printf("\r  [%s] %3d%%  %.1f / %.1f MB",
+                               filledBar.c_str(), pct, mbDone, mbTotal);
+                        fflush(stdout);
+                        lastPct = pct;
+                    }
+                } else {
+                    double mbDone = (double)downloaded / (1024.0 * 1024.0);
+                    printf("\r  Downloading... %.1f MB", mbDone);
+                    fflush(stdout);
+                }
             }
         }
+
+        printf("\n"); // newline after progress bar
+        fflush(stdout);
 
         outFile.close();
         WinHttpCloseHandle(hRequest);
