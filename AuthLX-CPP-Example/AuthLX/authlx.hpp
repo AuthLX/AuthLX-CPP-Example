@@ -150,6 +150,7 @@ namespace AuthLX {
         bool checkinit();
         nlohmann::json do_request(std::string endpoint, nlohmann::json post_data);
         bool download_file_winhttp(const std::string& url, const std::wstring& target_path);
+        std::pair<bool, std::string> validate_download_url(const std::string& url);
         void load_user_data(nlohmann::json data);
         void parse_ban_info(std::string msg);
         void login_hint(std::string msg);

@@ -1374,25 +1374,140 @@ namespace AuthLX {
             }
         }
 
-        if (dl_url.empty()) {
-            dl_url = api_url + "/file/latest/download?app_id=" + ownerid;
-        }
-
         info.latest_version = latest_ver.empty() ? version : latest_ver;
-        info.download_url = dl_url;
         info.file_name = file_n;
 
         if (!info.latest_version.empty() && info.latest_version != version) {
             info.update_available = true;
+            if (dl_url.empty()) {
+                LOG_WARN("[AUTO-UPDATE] A new version (" << info.latest_version << ") was found but no download URL is set.\n"
+                    "  -> Go to Dashboard -> Files -> Upload the update binary.\n"
+                    "  [!] Tip: Set a direct download link as the auto_update_link "
+                    "(not a webpage, not a redirect page).");
+                // Fallback: generic download endpoint
+                dl_url = api_url + "/file/latest/download?app_id=" + ownerid;
+            }
+        } else if (dl_url.empty()) {
+            // No version mismatch; still try fallback
+            dl_url = api_url + "/file/latest/download?app_id=" + ownerid;
         }
 
+        info.download_url = dl_url;
         this->update_info = info;
         return info;
     }
 
+    std::pair<bool, std::string> Api::validate_download_url(const std::string& url) {
+        if (url.empty())
+            return {false, "No download URL provided. Set the auto_update_link in your AuthLX Dashboard."};
+
+        if (url.substr(0, 7) != "http://" && url.substr(0, 8) != "https://")
+            return {false, "Invalid URL format: '" + url + "'. URL must start with http:// or https://."};
+
+        std::wstring host, path_prefix;
+        INTERNET_PORT port;
+        parse_url(url, host, path_prefix, port);
+
+        HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+        if (!hConnect)
+            return {false, "Could not connect to host: " + std::string(host.begin(), host.end()) +
+                    "\n  -> Check your internet connection."};
+
+        DWORD req_flags = (port == INTERNET_DEFAULT_HTTPS_PORT) ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(
+            hConnect, L"HEAD", path_prefix.c_str(),
+            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, req_flags);
+
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            return {false, "Could not create HTTP request for validation."};
+        }
+
+        DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy, sizeof(redirect_policy));
+
+        std::wstring ua = L"User-Agent: AuthLX-SDK-CPP/1.0 (" + to_wstring(name) + L" v" + to_wstring(version) + L")\r\n";
+        bool ok = WinHttpSendRequest(hRequest, ua.c_str(), (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+                  && WinHttpReceiveResponse(hRequest, NULL);
+
+        if (!ok) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            return {false, "Could not reach the download URL: " + url +
+                    "\n  -> Check your internet connection and verify the URL is reachable."};
+        }
+
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+        if (statusCode == 404) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
+            return {false, "Download URL returned 404 Not Found.\n"
+                    "  URL: " + url + "\n"
+                    "  -> The file may have been deleted or the URL is incorrect.\n"
+                    "  -> Please upload the update file and set the correct URL in your Dashboard."};
+        }
+        if (statusCode == 403) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
+            return {false, "Download URL returned 403 Forbidden.\n"
+                    "  URL: " + url + "\n"
+                    "  -> The server is blocking access. Check file permissions or use a public link."};
+        }
+        if (statusCode >= 400) {
+            WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
+            return {false, "Download URL returned HTTP " + std::to_string(statusCode) + ".\n"
+                    "  URL: " + url + "\n"
+                    "  -> Please verify the URL is correct and the file is publicly accessible."};
+        }
+
+        // Check Content-Type — HTML pages are NOT direct download links
+        WCHAR contentType[512] = {};
+        DWORD ctSize = sizeof(contentType);
+        if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_TYPE,
+                                WINHTTP_HEADER_NAME_BY_INDEX,
+                                contentType, &ctSize, WINHTTP_NO_HEADER_INDEX)) {
+            std::string ct(contentType, contentType + wcslen(contentType));
+            std::string ctLower = ct;
+            std::transform(ctLower.begin(), ctLower.end(), ctLower.begin(), ::tolower);
+            if (ctLower.find("text/html") != std::string::npos) {
+                WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
+                return {false, "The URL does not point to a direct file download.\n"
+                        "  URL: " + url + "\n"
+                        "  Content-Type: " + ct + "\n"
+                        "  [!] Tip: Use a direct download link, not a webpage URL.\n"
+                        "      Example: https://example.com/files/myapp-v2.0 (no HTML, no login page)"};
+            }
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        return {true, ""};
+    }
+
     bool Api::perform_update(const UpdateInfo& info) {
-        if (!info.update_available || info.download_url.empty()) {
-            LOG_ERROR("[AUTO-UPDATE] No update download URL available.");
+        if (!info.update_available) {
+            LOG_ERROR("[AUTO-UPDATE] No update is available to install.");
+            return false;
+        }
+
+        if (info.download_url.empty()) {
+            LOG_ERROR("[AUTO-UPDATE] Cannot install update: no download URL is available.\n"
+                      "  -> Upload the update binary in your AuthLX Dashboard -> Files section.\n"
+                      "  [!] Tip: The auto_update_link must be a DIRECT download URL (binary/executable), not a webpage.");
+            return false;
+        }
+
+        // Validate URL before downloading
+        LOG_INFO("[AUTO-UPDATE] Validating download URL: " << info.download_url);
+        printf("  [!] Tip: Make sure the URL above is a direct download link, not a webpage.\n");
+        fflush(stdout);
+
+        auto [isValid, errMsg] = validate_download_url(info.download_url);
+        if (!isValid) {
+            LOG_ERROR("[AUTO-UPDATE] URL validation failed:\n" << errMsg);
+            LOG_ERROR("[AUTO-UPDATE] Continuing without update. The application will keep running the current version.");
             return false;
         }
 
@@ -1406,7 +1521,8 @@ namespace AuthLX {
         LOG_INFO("[AUTO-UPDATE] Downloading update from: " << info.download_url);
 
         if (!download_file_winhttp(info.download_url, new_temp_path)) {
-            LOG_ERROR("[AUTO-UPDATE] Download failed.");
+            LOG_ERROR("[AUTO-UPDATE] Download failed. The application will keep running the current version.\n"
+                      "  [!] Tip: Ensure the auto_update_link in your Dashboard is a direct download URL.");
             DeleteFileW(new_temp_path.c_str());
             return false;
         }
