@@ -1546,4 +1546,91 @@ namespace AuthLX {
         }
     }
 
+    // =========================================================================
+    // VARIABLES MANAGEMENT (GLOBAL & PER-USER VARIABLES)
+    // =========================================================================
+
+    /**
+     * @brief Fetches a Global Application Variable by name.
+     *        If logged in, session_token is automatically sent for authenticated variables.
+     * @param name Name of the global variable set in the AuthLX Dashboard.
+     * @return String value of the variable, or empty string on failure.
+     */
+    std::string Api::var(std::string name) {
+        if (!checkinit()) return "";
+
+        nlohmann::json post_data;
+        post_data["app_id"] = this->ownerid;
+        post_data["secret"] = this->client_secret;
+        post_data["variable_name"] = name;
+        if (!this->session_token.empty()) {
+            post_data["session_token"] = this->session_token;
+        }
+
+        nlohmann::json response = do_request("/var", post_data);
+        if (!response.is_null() && response.value("status", "") == "success") {
+            if (response.contains("data") && response["data"].contains("value")) {
+                if (response["data"]["value"].is_string()) {
+                    return response["data"]["value"].get<std::string>();
+                }
+                return response["data"]["value"].dump();
+            }
+        }
+        return "";
+    }
+
+    /**
+     * @brief Fetches a Per-User Variable for the currently logged in user session.
+     * @param key Key/Name of the user variable.
+     * @return String value of the user variable, or empty string if not found.
+     */
+    std::string Api::get_user_var(std::string key) {
+        if (!checkinit()) return "";
+        if (session_token.empty()) {
+            LOG_ERROR("[VARIABLES] Session token required to fetch user variables. Please log in first.");
+            return "";
+        }
+
+        nlohmann::json post_data;
+        post_data["app_id"] = this->ownerid;
+        post_data["secret"] = this->client_secret;
+        post_data["session_token"] = this->session_token;
+        post_data["key"] = key;
+
+        nlohmann::json response = do_request("/vars/user/get", post_data);
+        if (!response.is_null() && response.value("status", "") == "success") {
+            if (response.contains("data") && response["data"].contains("value")) {
+                if (response["data"]["value"].is_string()) {
+                    return response["data"]["value"].get<std::string>();
+                }
+                return response["data"]["value"].dump();
+            }
+        }
+        return "";
+    }
+
+    /**
+     * @brief Creates or updates a Per-User Variable for the currently logged in user.
+     * @param key Key/Name of the user variable.
+     * @param value Value to store for the user.
+     * @return True if saved successfully, False if failed or read-only.
+     */
+    bool Api::set_user_var(std::string key, std::string value) {
+        if (!checkinit()) return false;
+        if (session_token.empty()) {
+            LOG_ERROR("[VARIABLES] Session token required to set user variables. Please log in first.");
+            return false;
+        }
+
+        nlohmann::json post_data;
+        post_data["app_id"] = this->ownerid;
+        post_data["secret"] = this->client_secret;
+        post_data["session_token"] = this->session_token;
+        post_data["key"] = key;
+        post_data["value"] = value;
+
+        nlohmann::json response = do_request("/vars/user/set", post_data);
+        return (!response.is_null() && response.value("status", "") == "success");
+    }
+
 }

@@ -98,6 +98,11 @@ namespace AuthLX {
         bool changeUsername(std::string new_username);
         bool forgot(std::string user, std::string new_password, std::string hwid = "");
 
+        // Variable Management (Global & Per-User Variables)
+        std::string var(std::string name);
+        std::string get_user_var(std::string key);
+        bool set_user_var(std::string key, std::string value);
+
         // Subscription & Expiry helpers
         bool has_active_subscription();
         double expiry_remaining();
