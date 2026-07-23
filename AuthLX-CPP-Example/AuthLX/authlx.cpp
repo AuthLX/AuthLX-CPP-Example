@@ -252,12 +252,21 @@ namespace AuthLX {
                 return;
             }
 
-            if (server_version != version) {
+            auto clean_ver = [](std::string v) -> std::string {
+                size_t start = v.find_first_not_of(" \t\r\n");
+                if (start != std::string::npos) v = v.substr(start);
+                if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) {
+                    v = v.substr(1);
+                }
+                return v;
+            };
+
+            if (clean_ver(server_version) != clean_ver(version)) {
                 LOG_ERROR("[UPDATE REQUIRED] Application version is outdated! Current: " << version << " | Required: " << server_version);
                 last_message = "Application version is outdated! Current: " + version + " | Required: " + server_version;
                 
                 if (auto_update_enabled) {
-                    LOG_INFO("[AUTO-UPDATE] Initiating auto-update to v" << server_version << "...");
+                    LOG_INFO("[AUTO-UPDATE] Initiating auto-update to " << server_version << "...");
                     UpdateInfo info = check_for_updates();
                     if (info.update_available) {
                         perform_update(info);
