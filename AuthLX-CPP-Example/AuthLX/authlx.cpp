@@ -34,6 +34,15 @@ namespace AuthLX {
         return strTo;
     }
 
+    // Helper: Null-safe JSON string getter (prevents nlohmann::json type_error crash on null fields)
+    static std::string safe_json_string(const nlohmann::json& j, const std::string& key, const std::string& fallback = "") {
+        if (!j.is_object() || !j.contains(key) || j[key].is_null()) return fallback;
+        try {
+            if (j[key].is_string()) return j[key].get<std::string>();
+        } catch (...) {}
+        return fallback;
+    }
+
     // Helper: Parse URL into host and path prefix
     static void parse_url(const std::string& url, std::wstring& host, std::wstring& path_prefix, INTERNET_PORT& port) {
         URL_COMPONENTS urlComp = { 0 };
@@ -177,6 +186,10 @@ namespace AuthLX {
             this->api_url = "https://authlx.com/api/v1/client";
         }
 
+        while (!this->api_url.empty() && this->api_url.back() == '/') {
+            this->api_url.pop_back();
+        }
+
         if (hash_to_check.empty()) {
             this->hash_to_check = Others::get_checksum();
         } else {
@@ -267,10 +280,15 @@ namespace AuthLX {
                 
                 if (auto_update_enabled) {
                     LOG_INFO("[AUTO-UPDATE] Initiating auto-update to " << server_version << "...");
+                    LOG_INFO("[AUTO-UPDATE] Calling check_for_updates()...");
                     UpdateInfo info = check_for_updates();
-                    if (info.update_available) {
-                        perform_update(info);
-                    }
+                    LOG_INFO("[AUTO-UPDATE] check_for_updates() returned URL: '" << info.download_url << "' | Available: " << (info.update_available ? "YES" : "NO"));
+                    info.update_available = true;
+                    LOG_INFO("[AUTO-UPDATE] Calling perform_update()...");
+                    bool res = perform_update(info);
+                    LOG_INFO("[AUTO-UPDATE] perform_update() completed with result: " << (res ? "SUCCESS" : "FAILED"));
+                } else {
+                    LOG_WARN("[AUTO-UPDATE] auto_update_enabled is FALSE! Skipping update.");
                 }
 
                 initialized = false;
@@ -1156,8 +1174,16 @@ namespace AuthLX {
         size_t pos = wcmd.find(L"--authlx-update-finish");
         if (pos == std::wstring::npos) return;
 
+        // Attach console output to parent process window
+        AttachConsole(ATTACH_PARENT_PROCESS);
+
+        LOG_INFO("[AUTO-UPDATE-STAGE] Executing process handoff stage...");
+
         size_t arg_start = wcmd.find_first_not_of(L" \t", pos + wcslen(L"--authlx-update-finish"));
-        if (arg_start == std::wstring::npos) return;
+        if (arg_start == std::wstring::npos) {
+            LOG_ERROR("[AUTO-UPDATE-STAGE] Missing target_path argument!");
+            return;
+        }
 
         std::wstring target_path;
         if (wcmd[arg_start] == L'"') {
@@ -1174,50 +1200,79 @@ namespace AuthLX {
             }
         }
 
-        if (target_path.empty()) return;
-
-        std::wstring current_path = get_current_executable_path();
-        if (current_path.empty()) return;
-
-        // Wait until target_path process exits and releases file lock (up to 10s)
-        int retries = 50;
-        while (retries-- > 0) {
-            HANDLE hFile = CreateFileW(target_path.c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                CloseHandle(hFile);
-                break;
-            }
-            Sleep(200);
+        if (target_path.empty()) {
+            LOG_ERROR("[AUTO-UPDATE-STAGE] Target path is empty!");
+            return;
         }
 
+        std::wstring current_path = get_current_executable_path();
+        if (current_path.empty()) {
+            LOG_ERROR("[AUTO-UPDATE-STAGE] Could not get current executable path!");
+            return;
+        }
+
+        LOG_INFO("[AUTO-UPDATE-STAGE] Waiting for original process to release file: " << to_string(target_path));
+        Sleep(500); // Give old process time to terminate completely
+
         std::wstring backup_path = target_path + L".old";
-        MoveFileExW(target_path.c_str(), backup_path.c_str(), MOVEFILE_REPLACE_EXISTING);
-        MoveFileExW(current_path.c_str(), target_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        LOG_INFO("[AUTO-UPDATE-STAGE] Replacing old binary (" << to_string(target_path) << ") with new binary (" << to_string(current_path) << ")");
+
+        bool move_ok = false;
+        for (int attempt = 1; attempt <= 20; attempt++) {
+            MoveFileExW(target_path.c_str(), backup_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+            if (MoveFileExW(current_path.c_str(), target_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                move_ok = true;
+                LOG_INFO("[AUTO-UPDATE-STAGE] File replacement succeeded on attempt " << attempt);
+                break;
+            }
+            Sleep(250);
+        }
+
+        if (!move_ok) {
+            LOG_ERROR("[AUTO-UPDATE-STAGE] MoveFileExW failed after 20 attempts! Win32 Error: " << GetLastError());
+        }
 
         // Spawn original application path
         STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi = { 0 };
         std::wstring launch_cmd = L"\"" + target_path + L"\"";
+        std::vector<wchar_t> cmd_buf(launch_cmd.begin(), launch_cmd.end());
+        cmd_buf.push_back(L'\0');
 
-        if (CreateProcessW(NULL, &launch_cmd[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        LOG_INFO("[AUTO-UPDATE-STAGE] Launching updated executable: " << to_string(target_path));
+        if (CreateProcessW(NULL, cmd_buf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
+            LOG_INFO("[AUTO-UPDATE-STAGE] Successfully launched updated executable. Exiting temporary updater.");
+        } else {
+            LOG_ERROR("[AUTO-UPDATE-STAGE] Failed to launch updated executable. Win32 Error: " << GetLastError());
         }
 
         ExitProcess(0);
     }
 
     bool Api::download_file_winhttp(const std::string& url, const std::wstring& target_path) {
-        if (url.empty() || target_path.empty()) return false;
+        LOG_INFO("[DOWNLOAD] Starting WinHTTP download...");
+        LOG_INFO("[DOWNLOAD] URL: " << url);
+        LOG_INFO("[DOWNLOAD] Target Path: " << to_string(target_path));
+        if (url.empty() || target_path.empty()) {
+            LOG_ERROR("[DOWNLOAD] Failed: URL or target_path is empty!");
+            return false;
+        }
 
         std::wstring host, path_prefix;
         INTERNET_PORT port;
         parse_url(url, host, path_prefix, port);
+        LOG_INFO("[DOWNLOAD] Host: " << to_string(host) << " | Port: " << port << " | Path: " << to_string(path_prefix));
 
         HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
-        if (!hConnect) return false;
+        if (!hConnect) {
+            LOG_ERROR("[DOWNLOAD] WinHttpConnect failed with error: " << GetLastError());
+            return false;
+        }
 
         DWORD req_flags = (port == INTERNET_DEFAULT_HTTPS_PORT) ? WINHTTP_FLAG_SECURE : 0;
+
         HINTERNET hRequest = WinHttpOpenRequest(
             hConnect,
             L"GET",
@@ -1229,6 +1284,7 @@ namespace AuthLX {
         );
 
         if (!hRequest) {
+            LOG_ERROR("[DOWNLOAD] WinHttpOpenRequest failed with error: " << GetLastError());
             WinHttpCloseHandle(hConnect);
             return false;
         }
@@ -1253,6 +1309,7 @@ namespace AuthLX {
         }
 
         if (!bResults) {
+            LOG_ERROR("[DOWNLOAD] WinHttpSendRequest/ReceiveResponse failed with error: " << GetLastError());
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
             return false;
@@ -1261,8 +1318,23 @@ namespace AuthLX {
         DWORD dwStatusCode = 0;
         DWORD dwSize = sizeof(dwStatusCode);
         WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &dwStatusCode, &dwSize, WINHTTP_NO_HEADER_INDEX);
+        LOG_INFO("[DOWNLOAD] Server response HTTP status: " << dwStatusCode);
+
+        // Check if redirect response (301/302/307)
+        if (dwStatusCode == 301 || dwStatusCode == 302 || dwStatusCode == 307) {
+            WCHAR locationHeader[2048] = {};
+            DWORD locSize = sizeof(locationHeader);
+            if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, locationHeader, &locSize, WINHTTP_NO_HEADER_INDEX)) {
+                std::string redirectUrl = to_string(locationHeader);
+                LOG_INFO("[DOWNLOAD] Following HTTP redirect to: " << redirectUrl);
+                WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hConnect);
+                return download_file_winhttp(redirectUrl, target_path);
+            }
+        }
 
         if (dwStatusCode != 200) {
+            LOG_ERROR("[AUTO-UPDATE] Download request returned HTTP " << dwStatusCode << " for path: " << to_string(path_prefix));
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
             return false;
@@ -1309,29 +1381,21 @@ namespace AuthLX {
 
                 if (totalBytes > 0) {
                     int pct = (int)(downloaded * 100ULL / totalBytes);
-                    if (pct != lastPct) {
-                        int filled = pct / 5;
-                        std::string bar(filled, static_cast<char>(0xE2)); // placeholder
-                        std::string filledBar = "";
-                        for (int i = 0; i < 20; ++i)
-                            filledBar += (i < filled) ? "\xe2\x96\x88" : "\xe2\x96\x91";
+                    if (pct < 0) pct = 0;
+                    if (pct > 100) pct = 100;
+                    if (pct != lastPct && (pct % 10 == 0 || pct == 100)) {
                         double mbDone  = (double)downloaded / (1024.0 * 1024.0);
                         double mbTotal = (double)totalBytes  / (1024.0 * 1024.0);
-                        printf("\r  [%s] %3d%%  %.1f / %.1f MB",
-                               filledBar.c_str(), pct, mbDone, mbTotal);
-                        fflush(stdout);
+                        LOG_INFO("[AUTO-UPDATE] Downloading... " << pct << "%  (" << mbDone << " / " << mbTotal << " MB)");
                         lastPct = pct;
                     }
                 } else {
                     double mbDone = (double)downloaded / (1024.0 * 1024.0);
-                    printf("\r  Downloading... %.1f MB", mbDone);
-                    fflush(stdout);
+                    LOG_INFO("[AUTO-UPDATE] Downloading... " << mbDone << " MB");
                 }
             }
         }
 
-        printf("\n"); // newline after progress bar
-        fflush(stdout);
 
         outFile.close();
         WinHttpCloseHandle(hRequest);
@@ -1348,71 +1412,80 @@ namespace AuthLX {
         UpdateInfo info;
         info.current_version = version;
 
-        nlohmann::json payload = {
-            {"app_id", ownerid},
-            {"name", name},
-            {"version", version},
-            {"secret", client_secret.empty() ? "NO_SECRET" : client_secret}
-        };
+        try {
+            nlohmann::json payload = {
+                {"app_id", ownerid},
+                {"name", name},
+                {"version", version},
+                {"secret", client_secret.empty() ? "NO_SECRET" : client_secret}
+            };
 
-        std::string latest_ver;
-        std::string dl_url;
-        std::string file_n;
+            std::string latest_ver;
+            std::string dl_url;
+            std::string file_n;
 
-        // 1. Query /file/latest first — authoritative latest release file info from Files manager
-        nlohmann::json file_res = do_request("/file/latest", payload);
-        if (!file_res.is_null() && file_res.value("status", "") == "success") {
-            auto data = file_res.value("data", nlohmann::json::object());
-            auto file_obj = data.value("file", nlohmann::json::object());
-            if (!file_obj.empty()) {
-                latest_ver = file_obj.value("version_tag", "");
-                dl_url = file_obj.value("download_url", "");
-                file_n = file_obj.value("name", "");
+            // Version comparison helper with leading 'v'/'V' normalization
+            auto clean_ver = [](std::string v) -> std::string {
+                size_t start = v.find_first_not_of(" \t\r\n");
+                if (start != std::string::npos) v = v.substr(start);
+                if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) {
+                    v = v.substr(1);
+                }
+                return v;
+            };
+
+            // 1. Query /file/latest first — authoritative latest release file info from Files manager
+            nlohmann::json file_res = do_request("/file/latest", payload);
+            if (!file_res.is_null() && safe_json_string(file_res, "status") == "success") {
+                if (file_res.contains("data") && file_res["data"].is_object()) {
+                    auto data = file_res["data"];
+                    if (data.contains("file") && data["file"].is_object()) {
+                        auto file_obj = data["file"];
+                        latest_ver = safe_json_string(file_obj, "version_tag");
+                        dl_url = safe_json_string(file_obj, "download_url");
+                        file_n = safe_json_string(file_obj, "name");
+                    }
+                }
             }
-        }
 
-        // 2. Query /init endpoint as fallback/enrichment
-        nlohmann::json response = do_request("/init", payload);
-        if (!response.is_null() && response.value("status", "") == "success") {
-            auto app_info = response.value("app_info", nlohmann::json::object());
-            if (latest_ver.empty()) {
-                latest_ver = app_info.value("version", "");
+            // 2. Query /init endpoint as fallback/enrichment
+            nlohmann::json response = do_request("/init", payload);
+            std::string init_ver;
+            if (!response.is_null() && safe_json_string(response, "status") == "success") {
+                if (response.contains("app_info") && response["app_info"].is_object()) {
+                    auto app_info = response["app_info"];
+                    init_ver = safe_json_string(app_info, "version");
+                    if (latest_ver.empty() || (!init_ver.empty() && clean_ver(init_ver) != clean_ver(version))) {
+                        latest_ver = init_ver;
+                    }
+                    if (dl_url.empty()) {
+                        dl_url = safe_json_string(app_info, "auto_update_link");
+                    }
+                }
             }
-            if (dl_url.empty()) {
-                dl_url = app_info.value("auto_update_link", "");
+
+            info.latest_version = latest_ver.empty() ? (init_ver.empty() ? version : init_ver) : latest_ver;
+            info.file_name = file_n;
+
+            std::string clean_current = clean_ver(version);
+            std::string clean_latest = clean_ver(info.latest_version);
+            std::string clean_init = clean_ver(init_ver);
+
+            if ((!info.latest_version.empty() && clean_latest != clean_current) ||
+                (!clean_init.empty() && clean_init != clean_current)) {
+                info.update_available = true;
             }
-        }
 
-        info.latest_version = latest_ver.empty() ? version : latest_ver;
-        info.file_name = file_n;
-
-        // Version comparison with leading 'v'/'V' normalization (e.g., "v1.4" vs "1.4")
-        auto clean_ver = [](std::string v) -> std::string {
-            size_t start = v.find_first_not_of(" \t\r\n");
-            if (start != std::string::npos) v = v.substr(start);
-            if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) {
-                v = v.substr(1);
-            }
-            return v;
-        };
-
-        std::string clean_current = clean_ver(version);
-        std::string clean_latest = clean_ver(info.latest_version);
-
-        if (!info.latest_version.empty() && clean_latest != clean_current) {
-            info.update_available = true;
-            if (dl_url.empty()) {
-                LOG_WARN("[AUTO-UPDATE] A new version (" << info.latest_version << ") was found but no download URL is set.\n"
-                    "  -> Go to Dashboard -> Files -> Upload the update binary.\n"
-                    "  [!] Tip: Set a direct download link as the auto_update_link "
-                    "(not a webpage, not a redirect page).");
-                dl_url = api_url + "/download/latest/" + name;
-            }
-        } else if (dl_url.empty()) {
+            // Always target the Latest Mark release endpoint (/download/latest/:appName) for auto-update
             dl_url = api_url + "/download/latest/" + name;
+
+            info.download_url = dl_url;
+        } catch (const std::exception& e) {
+            LOG_ERROR("[AUTO-UPDATE] Exception in check_for_updates: " << e.what());
+            info.download_url = api_url + "/download/latest/" + name;
+            info.update_available = true;
         }
 
-        info.download_url = dl_url;
         this->update_info = info;
         return info;
     }
@@ -1507,27 +1580,8 @@ namespace AuthLX {
     }
 
     bool Api::perform_update(const UpdateInfo& info) {
-        if (!info.update_available) {
-            LOG_ERROR("[AUTO-UPDATE] No update is available to install.");
-            return false;
-        }
-
-        if (info.download_url.empty()) {
-            LOG_ERROR("[AUTO-UPDATE] Cannot install update: no download URL is available.\n"
-                      "  -> Upload the update binary in your AuthLX Dashboard -> Files section.\n"
-                      "  [!] Tip: The auto_update_link must be a DIRECT download URL (binary/executable), not a webpage.");
-            return false;
-        }
-
-        // Validate URL before downloading
-        LOG_INFO("[AUTO-UPDATE] Validating download URL: " << info.download_url);
-        printf("  [!] Tip: Make sure the URL above is a direct download link, not a webpage.\n");
-        fflush(stdout);
-
-        auto [isValid, errMsg] = validate_download_url(info.download_url);
-        if (!isValid) {
-            LOG_ERROR("[AUTO-UPDATE] URL validation failed:\n" << errMsg);
-            LOG_ERROR("[AUTO-UPDATE] Continuing without update. The application will keep running the current version.");
+        if (!info.update_available || info.download_url.empty()) {
+            LOG_ERROR("[AUTO-UPDATE] Cannot install update: download URL empty or update not available.");
             return false;
         }
 
@@ -1537,31 +1591,52 @@ namespace AuthLX {
             return false;
         }
 
-        std::wstring new_temp_path = current_exe + L".new";
-        LOG_INFO("[AUTO-UPDATE] Downloading update from: " << info.download_url);
+        std::wstring backup_exe = current_exe + L".old";
 
-        if (!download_file_winhttp(info.download_url, new_temp_path)) {
-            LOG_ERROR("[AUTO-UPDATE] Download failed. The application will keep running the current version.\n"
-                      "  [!] Tip: Ensure the auto_update_link in your Dashboard is a direct download URL.");
-            DeleteFileW(new_temp_path.c_str());
+        LOG_INFO("[AUTO-UPDATE] Preparing file update for: " << to_string(current_exe));
+        LOG_INFO("[AUTO-UPDATE] Renaming current binary to backup: " << to_string(backup_exe));
+
+        // Windows allows a running executable to rename itself
+        if (!MoveFileExW(current_exe.c_str(), backup_exe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            LOG_WARN("[AUTO-UPDATE] Rename self to .old failed with error: " << GetLastError() << ". Attempting direct overwrite...");
+        }
+
+        LOG_INFO("[AUTO-UPDATE] Downloading update from: " << info.download_url);
+        bool download_ok = download_file_winhttp(info.download_url, current_exe);
+
+        // If initial download fails or file is not found, wait 10 seconds and retry one last time
+        if (!download_ok) {
+            LOG_WARN("[AUTO-UPDATE] File download failed or not found! Waiting 10 seconds before final retry attempt...");
+            Sleep(10000);
+
+            std::string latest_fallback = api_url + "/download/latest/" + name;
+            LOG_INFO("[AUTO-UPDATE] Retrying final download attempt from: " << latest_fallback);
+            download_ok = download_file_winhttp(latest_fallback, current_exe);
+        }
+
+        if (!download_ok) {
+            LOG_ERROR("[AUTO-UPDATE] Final download retry failed! No latest release file available. Restoring backup and exiting...");
+            MoveFileExW(backup_exe.c_str(), current_exe.c_str(), MOVEFILE_REPLACE_EXISTING);
+            ExitProcess(1);
             return false;
         }
 
-        LOG_INFO("[AUTO-UPDATE] Download completed successfully. Launching process handoff...");
+        LOG_INFO("[AUTO-UPDATE] Download completed successfully! Launching updated executable...");
 
         STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi = { 0 };
-        std::wstring launch_cmd = L"\"" + new_temp_path + L"\" --authlx-update-finish \"" + current_exe + L"\"";
+        std::wstring launch_cmd = L"\"" + current_exe + L"\"";
+        std::vector<wchar_t> cmd_buf(launch_cmd.begin(), launch_cmd.end());
+        cmd_buf.push_back(L'\0');
 
-        if (CreateProcessW(NULL, &launch_cmd[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        if (CreateProcessW(NULL, cmd_buf.data(), NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
-            LOG_INFO("[AUTO-UPDATE] Handed off execution to updated binary. Terminating old process.");
+            LOG_INFO("[AUTO-UPDATE] Updated executable launched successfully. Exiting old process...");
             ExitProcess(0);
             return true;
         } else {
-            LOG_ERROR("[AUTO-UPDATE] Failed to spawn updater process. Win32 Error: " << GetLastError());
-            DeleteFileW(new_temp_path.c_str());
+            LOG_ERROR("[AUTO-UPDATE] Failed to launch updated executable. Win32 Error: " << GetLastError());
             return false;
         }
     }
