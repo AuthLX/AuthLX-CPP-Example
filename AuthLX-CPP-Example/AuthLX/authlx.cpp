@@ -1350,46 +1350,57 @@ namespace AuthLX {
         std::string dl_url;
         std::string file_n;
 
-        // 1. Query /init endpoint
-        nlohmann::json response = do_request("/init", payload);
-        if (!response.is_null() && response.value("status", "") == "success") {
-            auto app_info = response.value("app_info", nlohmann::json::object());
-            latest_ver = app_info.value("version", "");
-            dl_url = app_info.value("auto_update_link", "");
-        }
-
-        // 2. Query /file/latest endpoint as fallback/enrichment
+        // 1. Query /file/latest first — authoritative latest release file info from Files manager
         nlohmann::json file_res = do_request("/file/latest", payload);
         if (!file_res.is_null() && file_res.value("status", "") == "success") {
             auto data = file_res.value("data", nlohmann::json::object());
             auto file_obj = data.value("file", nlohmann::json::object());
             if (!file_obj.empty()) {
-                if (latest_ver.empty()) {
-                    latest_ver = file_obj.value("version_tag", "");
-                }
-                if (dl_url.empty()) {
-                    dl_url = file_obj.value("download_url", "");
-                }
+                latest_ver = file_obj.value("version_tag", "");
+                dl_url = file_obj.value("download_url", "");
                 file_n = file_obj.value("name", "");
+            }
+        }
+
+        // 2. Query /init endpoint as fallback/enrichment
+        nlohmann::json response = do_request("/init", payload);
+        if (!response.is_null() && response.value("status", "") == "success") {
+            auto app_info = response.value("app_info", nlohmann::json::object());
+            if (latest_ver.empty()) {
+                latest_ver = app_info.value("version", "");
+            }
+            if (dl_url.empty()) {
+                dl_url = app_info.value("auto_update_link", "");
             }
         }
 
         info.latest_version = latest_ver.empty() ? version : latest_ver;
         info.file_name = file_n;
 
-        if (!info.latest_version.empty() && info.latest_version != version) {
+        // Version comparison with leading 'v'/'V' normalization (e.g., "v1.4" vs "1.4")
+        auto clean_ver = [](std::string v) -> std::string {
+            size_t start = v.find_first_not_of(" \t\r\n");
+            if (start != std::string::npos) v = v.substr(start);
+            if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) {
+                v = v.substr(1);
+            }
+            return v;
+        };
+
+        std::string clean_current = clean_ver(version);
+        std::string clean_latest = clean_ver(info.latest_version);
+
+        if (!info.latest_version.empty() && clean_latest != clean_current) {
             info.update_available = true;
             if (dl_url.empty()) {
                 LOG_WARN("[AUTO-UPDATE] A new version (" << info.latest_version << ") was found but no download URL is set.\n"
                     "  -> Go to Dashboard -> Files -> Upload the update binary.\n"
                     "  [!] Tip: Set a direct download link as the auto_update_link "
                     "(not a webpage, not a redirect page).");
-                // Fallback: generic download endpoint
-                dl_url = api_url + "/file/latest/download?app_id=" + ownerid;
+                dl_url = api_url + "/download/latest/" + name;
             }
         } else if (dl_url.empty()) {
-            // No version mismatch; still try fallback
-            dl_url = api_url + "/file/latest/download?app_id=" + ownerid;
+            dl_url = api_url + "/download/latest/" + name;
         }
 
         info.download_url = dl_url;
