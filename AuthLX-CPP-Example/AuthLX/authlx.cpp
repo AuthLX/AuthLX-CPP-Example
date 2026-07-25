@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
 #include <sddl.h> // For ConvertSidToStringSidW
 #include <sstream>
 #include <iomanip>
@@ -12,6 +13,7 @@
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
 
 namespace AuthLX {
@@ -981,6 +983,11 @@ namespace AuthLX {
         debug = enable;
     }
 
+    void Api::add_pinned_cert(std::string sha256_hash) {
+        std::transform(sha256_hash.begin(), sha256_hash.end(), sha256_hash.begin(), ::tolower);
+        this->pinned_cert_hashes.push_back(sha256_hash);
+    }
+
     std::map<std::string, std::string> Api::debugInfo() {
         std::map<std::string, std::string> info;
         info["debug_enabled"] = debug ? "true" : "false";
@@ -1089,6 +1096,63 @@ namespace AuthLX {
             LOG_ERROR("Request timed out or network error (Error: " << err << ")");
             last_message = "Request timed out or network error (Error: " + std::to_string(err) + ")";
             return nullptr;
+        }
+
+        // ── TLS Certificate Pinning Check (Chain-Aware) ───────────────────────
+        if (bResults && !pinned_cert_hashes.empty()) {
+            PCCERT_CONTEXT pCertContext = NULL;
+            DWORD dwSize = sizeof(pCertContext);
+            
+            if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &pCertContext, &dwSize)) {
+                
+                CERT_CHAIN_PARA chainPara = { sizeof(chainPara) };
+                PCCERT_CHAIN_CONTEXT pChainContext = NULL;
+                bool pin_matched = false;
+
+                if (CertGetCertificateChain(HCCE_CURRENT_USER, pCertContext, NULL, pCertContext->hCertStore, &chainPara, 0, NULL, &pChainContext)) {
+                    
+                    // Loop through the certificate chain (Leaf -> Intermediate -> Root)
+                    if (pChainContext->cChain > 0) {
+                        PCERT_SIMPLE_CHAIN pSimpleChain = pChainContext->rgpChain[0];
+                        for (DWORD i = 0; i < pSimpleChain->cElement; i++) {
+                            PCCERT_CONTEXT pChainElement = pSimpleChain->rgpElement[i]->pCertContext;
+                            
+                            // Hash this element
+                            BYTE hashBuf[32];
+                            DWORD hashSz = sizeof(hashBuf);
+                            if (CertGetCertificateContextProperty(pChainElement, CERT_SHA256_HASH_PROP_ID, hashBuf, &hashSz)) {
+                                std::string actual_hash;
+                                char hexBuf[3];
+                                for (DWORD j = 0; j < hashSz; j++) {
+                                    sprintf_s(hexBuf, "%02x", hashBuf[j]);
+                                    actual_hash += hexBuf;
+                                }
+                                
+                                // Check if this hash is in our allowed list
+                                if (std::find(pinned_cert_hashes.begin(), pinned_cert_hashes.end(), actual_hash) != pinned_cert_hashes.end()) {
+                                    pin_matched = true;
+                                    break; // Valid root/intermediate found!
+                                }
+                            }
+                        }
+                    }
+                    CertFreeCertificateChain(pChainContext);
+                }
+
+                CertFreeCertificateContext(pCertContext);
+
+                if (!pin_matched) {
+                    WinHttpCloseHandle(hRequest);
+                    WinHttpCloseHandle(hConnect);
+                    LOG_ERROR("[SECURITY] TLS Certificate Chain Pinning FAILED! MITM Detected.");
+                    ExitProcess(1); // Hard terminate
+                }
+            } else {
+                WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hConnect);
+                LOG_ERROR("[SECURITY] Could not verify TLS Certificate. Connection dropped.");
+                ExitProcess(1);
+            }
         }
 
         // ── HTTP Status Code Validation ───────────────────────────────────────

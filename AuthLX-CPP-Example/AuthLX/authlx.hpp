@@ -141,6 +141,9 @@ namespace AuthLX {
         void setDebug(bool enable);
         std::map<std::string, std::string> debugInfo();
 
+        // ── Security configuration ───────────────────────────────────────
+        void add_pinned_cert(std::string sha256_hash);
+
     private:
         int login_fails = 0;
         double lockout_end = 0.0;
@@ -148,6 +151,7 @@ namespace AuthLX {
 
         std::vector<std::string> allowed_hosts;
         std::vector<std::string> pinned_public_keys;
+        std::vector<std::string> pinned_cert_hashes;
 
         std::thread ban_monitor_thread;
         std::atomic<bool> ban_monitor_active{false};

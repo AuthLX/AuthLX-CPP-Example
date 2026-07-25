@@ -326,7 +326,13 @@ int main() {
     );
 
     // Optional host locking whitelist
-    authlxapp.set_allowed_hosts({ "authlx.com" });
+    authlxapp.set_allowed_hosts({ "api.authlx.com" });
+
+    // Optional TLS Certificate Pinning (Chain-Aware)
+    // Cloudflare / Google Trust Services (GTS Root R1)
+    authlxapp.add_pinned_cert("d947432abde7b7fa90fc2e6b59101b1280e0e1c7e4e40fa3c6887fff57a7f4cf");
+    // Baltimore CyberTrust Root (Cloudflare legacy fallback)
+    authlxapp.add_pinned_cert("16af57a9f676b0ab126095aa5ebafc57b8c71b6ab4945d81b85bbd13c77148a0");
 
     std::cout << "✓ Initialised in " << (secret.empty() ? "OFF" : "SECURE") << " mode." << std::endl;
     std::cout << "  HWID Method : " << authlxapp.hwid_method << std::endl;
