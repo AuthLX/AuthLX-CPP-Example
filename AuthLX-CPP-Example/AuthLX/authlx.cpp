@@ -182,8 +182,11 @@ namespace AuthLX {
     Api::Api(std::string name, std::string ownerid, std::string version, std::string client_secret, std::string hash_to_check, std::string api_url)
         : name(name), ownerid(ownerid), version(version), client_secret(client_secret), api_url(api_url) {
 
+        // Default to v2 (Signed Response Protocol secured) direct API endpoint.
+        // If the caller explicitly passes a URL, honour it (backward compat for
+        // anyone who compiled with a custom url= argument pointing at v1).
         if (this->api_url.empty()) {
-            this->api_url = "https://authlx.com/api/v1/client";
+            this->api_url = "https://api.authlx.com/api/v2/client";
         }
 
         while (!this->api_url.empty() && this->api_url.back() == '/') {
@@ -196,9 +199,16 @@ namespace AuthLX {
             this->hash_to_check = hash_to_check;
         }
 
+        // Default host whitelist — blocks DNS redirect attacks.
+        // Only api.authlx.com is ever a valid destination.
+        // Developers can call clear_allowed_hosts() then add_allowed_host() to override.
+        if (allowed_hosts.empty()) {
+            allowed_hosts = {"api.authlx.com"};
+        }
+
         // Initialize WinHTTP Session with direct access (ignores system proxy - Anti-MITM)
         hSession = WinHttpOpen(
-            L"AuthLX-SDK-CPP/1.0",
+            L"AuthLX-SDK-CPP/2.0",
             WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME,
             WINHTTP_NO_PROXY_BYPASS,
@@ -244,11 +254,13 @@ namespace AuthLX {
 
         Others::anti_debug();
 
+        // SECURITY: client_secret is intentionally NOT included in the /init payload.
+        // It lives exclusively in this compiled binary for local HMAC response verification.
+        // Sending it over the wire (even over HTTPS) exposes it to proxy interception.
         nlohmann::json payload = {
             {"app_id", ownerid},
             {"name", name},
-            {"version", version},
-            {"secret", client_secret.empty() ? "NO_SECRET" : client_secret}
+            {"version", version}
         };
 
         nlohmann::json response = do_request("/init", payload);
@@ -339,7 +351,85 @@ namespace AuthLX {
         return payload;
     }
 
-    // ─── Authentication ──────────────────────────────────────────────────────
+    // ─── Signed Response Protocol (SRP) ──────────────────────────────────────
+    //
+    // Every SDK request embeds a random `request_nonce`.
+    // The server echoes this nonce back in X-Response-Nonce and includes
+    // X-Response-Sig = HMAC_SHA256(canonical_body + ":" + nonce, client_secret).
+    //
+    // The SDK verifies:
+    //   1. X-Response-Nonce == the nonce we sent  → prevents stored-response replay
+    //   2. HMAC locally recomputed == X-Response-Sig → proves the server holds client_secret
+    //
+    // Result: HTTP Debugger/Fiddler cannot spoof responses without knowing client_secret.
+
+    std::string Api::generate_request_nonce() {
+        return generate_nonce(32);
+    }
+
+    bool Api::verify_response_signature(
+        const std::string& response_body,
+        const std::string& request_nonce,
+        const std::string& sig_header,
+        const std::string& nonce_header
+    ) {
+        // ── Missing headers logic ─────────────────────────────────────────────
+        // v2 server ALWAYS signs when client_secret is configured.
+        // If headers are absent but we have a secret: something stripped them → ATTACK.
+        // If no secret configured: unsigned mode is acceptable (opt-in).
+        if (sig_header.empty() || nonce_header.empty()) {
+            if (!client_secret.empty()) {
+                LOG_ERROR("[SRP] *** CRITICAL: Signature headers missing on secret-enabled app. "
+                          "Possible header-stripping MITM attack. ***");
+                return false;  // Hard fail
+            }
+            // No secret configured — unsigned mode, skip verification
+            if (debug) {
+                LOG_DEBUG("[SRP] No signature headers and no secret — unsigned mode, skipping.");
+            }
+            return true;
+        }
+
+        // 1. Verify nonce echo — prevents stored-response replay attacks.
+        // A response captured at T=0 cannot be used at T=1 because nonces differ.
+        if (nonce_header != request_nonce) {
+            LOG_ERROR("[SRP] *** NONCE MISMATCH! Expected: " << request_nonce
+                      << " | Got: " << nonce_header << " ***");
+            LOG_ERROR("[SRP] Response replay or spoofing attempt DETECTED.");
+            return false;
+        }
+
+        // 2. Recompute expected HMAC locally.
+        // Must match the server's canonical serialization: body + ":" + nonce.
+        std::string payload = response_body + ":" + request_nonce;
+        std::string expected_sig = hmac_sha256(client_secret, payload);
+
+        if (expected_sig.empty()) {
+            LOG_ERROR("[SRP] Failed to compute local HMAC — BCrypt error.");
+            return false;
+        }
+
+        // 3. Constant-time comparison — prevents timing side-channel attacks.
+        if (expected_sig.size() != sig_header.size()) {
+            LOG_ERROR("[SRP] *** SIGNATURE LENGTH MISMATCH — spoofing attempt. ***");
+            return false;
+        }
+        int diff = 0;
+        for (size_t i = 0; i < expected_sig.size(); ++i) {
+            diff |= (expected_sig[i] ^ sig_header[i]);
+        }
+        if (diff != 0) {
+            LOG_ERROR("[SRP] *** SIGNATURE MISMATCH! Response has been tampered or spoofed. ***");
+            return false;
+        }
+
+        if (debug) {
+            LOG_DEBUG("[SRP] Response signature verified OK. Nonce: " << request_nonce.substr(0, 8) << "...");
+        }
+        return true;
+    }
+
+
 
     bool Api::login(std::string user, std::string password, std::string hwid) {
         if (!checkinit()) return false;
@@ -381,6 +471,15 @@ namespace AuthLX {
             }
 
             mark_authenticated();
+
+            // Post-login verification check: verify live session immediately
+            if (!check()) {
+                session_token = "";
+                user_data.is_authenticated = false;
+                std::cerr << "Login Failed: Immediate session verification failed." << std::endl;
+                return false;
+            }
+
             std::cout << "Successfully logged in as '" << user_data.username << "'!" << std::endl;
             return true;
         }
@@ -528,9 +627,7 @@ namespace AuthLX {
 
     bool Api::check() {
         if (!checkinit()) return false;
-        if (session_token.empty()) {
-            return false;
-        }
+        if (session_token.empty()) return false;
 
         nlohmann::json payload = {
             {"app_id", ownerid},
@@ -538,7 +635,34 @@ namespace AuthLX {
         };
 
         nlohmann::json response = do_request("/verify-session", payload);
-        return (!response.is_null() && response.value("status", "") == "success");
+
+        if (!response.is_null() && response.value("status", "") == "success") {
+            // ── Refresh user_data from server ground truth ─────────────────────
+            // v2 verify-session returns live DB state. Override whatever was set
+            // at login time (which may have been spoofed pre-SRP).
+            auto sess = response.value("session", nlohmann::json::object());
+            if (!sess.empty()) {
+                std::string fresh_expiry = sess.value("expiry", "");
+                std::string fresh_sub    = sess.value("subscription", "");
+                std::string acct_status  = sess.value("account_status", "active");
+
+                if (!fresh_expiry.empty()) user_data.expires      = fresh_expiry;
+                if (!fresh_sub.empty())    user_data.subscription = fresh_sub;
+
+                // If server says banned/paused/expired — kill immediately
+                if (acct_status == "banned" || acct_status == "paused" ||
+                    acct_status == "expired" || acct_status == "deleted") {
+                    LOG_ERROR("[SECURITY] Session check: account status is '" << acct_status
+                              << "'. Terminating.");
+                    user_data.is_authenticated = false;
+                    session_token = "";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return false;
     }
 
     bool Api::verifyToken(std::string standalone_token) {
@@ -764,6 +888,12 @@ namespace AuthLX {
     }
 
     void Api::ban_monitor_loop(int interval) {
+        // Security: cap the check interval at 20 seconds maximum.
+        // 120s was too long — a spoofed session could persist for 2 minutes.
+        // 20s is short enough to terminate quickly while not hammering the server.
+        const int max_interval = 20;
+        const int effective_interval = (interval > max_interval) ? max_interval : interval;
+
         while (ban_monitor_active) {
             if (session_token.empty()) {
                 Sleep(1000);
@@ -771,11 +901,12 @@ namespace AuthLX {
             }
 
             if (debug) {
-                std::cout << "[DEBUG] Ban monitor: checking session..." << std::endl;
+                std::cout << "[DEBUG] Ban monitor: checking session (interval=" << effective_interval << "s)..." << std::endl;
             }
 
             if (!check() || !has_active_subscription()) {
-                std::cerr << "\n[SECURITY] Session revoked, expired, or account paused at runtime." << std::endl;
+                LOG_ERROR("[SECURITY] Session revoked, user deleted, subscription expired, or account banned.");
+                LOG_ERROR("[SECURITY] Terminating application. No bypass possible.");
                 user_data.is_authenticated = false;
                 session_token = "";
 
@@ -788,7 +919,7 @@ namespace AuthLX {
                     ir[0].Event.KeyEvent.bKeyDown = TRUE;
                     ir[0].Event.KeyEvent.wRepeatCount = 1;
                     ir[0].Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
-                    ir[0].Event.KeyEvent.wVirtualScanCode = (WORD)MapVirtualKey(VK_RETURN, 0); // MAPVK_VK_TO_VSC is 0
+                    ir[0].Event.KeyEvent.wVirtualScanCode = (WORD)MapVirtualKey(VK_RETURN, 0);
                     ir[0].Event.KeyEvent.uChar.UnicodeChar = L'\r';
 
                     ir[1] = ir[0];
@@ -798,11 +929,13 @@ namespace AuthLX {
                     WriteConsoleInput(hInput, ir, 2, &written);
                 }
 #endif
-                break;
+                // Hard terminate — SRP-verified session failure means the server
+                // confirmed the user/session is invalid. No way to continue.
+                ExitProcess(1);
             }
 
-            // Sleep in small increments to respond quickly to shutdown request
-            for (int i = 0; i < interval && ban_monitor_active; ++i) {
+            // Sleep in 1s increments to respond quickly to shutdown request
+            for (int i = 0; i < effective_interval && ban_monitor_active; ++i) {
                 Sleep(1000);
             }
         }
@@ -916,8 +1049,17 @@ namespace AuthLX {
         }
 
         // Set User-Agent and content-type headers
-        std::wstring headers = L"Content-Type: application/json\r\nUser-Agent: AuthLX-SDK-CPP/1.0 (" + to_wstring(name) + L" v" + to_wstring(version) + L")\r\n";
-        
+        std::wstring headers = L"Content-Type: application/json\r\nUser-Agent: AuthLX-SDK-CPP/2.0 (" + to_wstring(name) + L" v" + to_wstring(version) + L")\r\n";
+
+        // ── Signed Response Protocol: inject request_nonce ────────────────────
+        // Each request carries a unique random nonce. The server echoes it back
+        // in X-Response-Nonce (signed). Nonce mismatch = replay attack detected.
+        std::string req_nonce;
+        if (!client_secret.empty()) {
+            req_nonce = generate_request_nonce();
+            post_data["request_nonce"] = req_nonce;
+        }
+
         std::string post_data_str = post_data.dump();
 
         if (debug) {
@@ -949,7 +1091,43 @@ namespace AuthLX {
             return nullptr;
         }
 
-        nlohmann::json response_json = nullptr;
+        // ── HTTP Status Code Validation ───────────────────────────────────────
+        // Reject non-200 responses immediately — prevents processing error pages as auth data
+        if (bResults) {
+            DWORD dwStatusCode = 0;
+            DWORD dwStatusSize = sizeof(dwStatusCode);
+            if (WinHttpQueryHeaders(hRequest,
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX,
+                    &dwStatusCode, &dwStatusSize, WINHTTP_NO_HEADER_INDEX)) {
+                if (dwStatusCode != 200) {
+                    WinHttpCloseHandle(hRequest);
+                    WinHttpCloseHandle(hConnect);
+                    if (debug) {
+                        LOG_DEBUG("HTTP " << dwStatusCode << " from " << endpoint);
+                    }
+                    last_message = "Server returned HTTP " + std::to_string(dwStatusCode);
+                    return nullptr;
+                }
+            }
+        }
+
+        // ── Read SRP Response Signature Headers ───────────────────────────────
+        std::string sig_header, nonce_header;
+        if (bResults && !client_secret.empty()) {
+            WCHAR sig_buf[512] = {};
+            WCHAR nonce_buf[512] = {};
+            DWORD sig_sz   = sizeof(sig_buf);
+            DWORD nonce_sz = sizeof(nonce_buf);
+
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
+                L"X-Response-Sig", sig_buf, &sig_sz, WINHTTP_NO_HEADER_INDEX);
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
+                L"X-Response-Nonce", nonce_buf, &nonce_sz, WINHTTP_NO_HEADER_INDEX);
+
+            sig_header   = to_string(sig_buf);
+            nonce_header = to_string(nonce_buf);
+        }
 
         if (bResults) {
             std::vector<char> response_data;
@@ -981,6 +1159,23 @@ namespace AuthLX {
                     LOG_ERROR("Invalid JSON response from server. Error: " << e.what() << "\nRaw response: " << resp_str);
                     last_message = "Invalid response from server.";
                     return nullptr;
+                }
+
+                // ── SRP Verification ──────────────────────────────────────────────────
+                // Cryptographically verify this response was produced by our server.
+                // Nonce mismatch  = HTTP Debugger / Fiddler replaying captured response.
+                // HMAC mismatch   = response body was tampered (field values changed).
+                // Missing headers = proxy stripped the SRP headers (header-stripping attack).
+                // Any failure → hard terminate. No second chances. No forged auth state.
+                if (!client_secret.empty()) {
+                    if (!verify_response_signature(resp_str, req_nonce, sig_header, nonce_header)) {
+                        WinHttpCloseHandle(hRequest);
+                        WinHttpCloseHandle(hConnect);
+                        LOG_ERROR("[SRP] *** SECURITY VIOLATION: Response integrity check FAILED. ***");
+                        LOG_ERROR("[SRP] This is a man-in-the-middle or proxy injection attack.");
+                        last_message = "SECURITY: Response integrity check failed. Possible MITM attack.";
+                        ExitProcess(1);  // Hard terminate — zero tolerance for forged responses
+                    }
                 }
             }
         } else {
@@ -1413,11 +1608,12 @@ namespace AuthLX {
         info.current_version = version;
 
         try {
+            // SECURITY: client_secret is intentionally NOT included in check_for_updates payload.
+            // It lives exclusively in this compiled binary — never transmitted over the wire.
             nlohmann::json payload = {
                 {"app_id", ownerid},
                 {"name", name},
-                {"version", version},
-                {"secret", client_secret.empty() ? "NO_SECRET" : client_secret}
+                {"version", version}
             };
 
             std::string latest_ver;

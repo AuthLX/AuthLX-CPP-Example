@@ -165,6 +165,17 @@ namespace AuthLX {
         std::tuple<std::string, std::string, std::string> compute_hash_signature();
         nlohmann::json build_hash_payload();
 
+        // ── Signed Response Protocol (SRP) ────────────────────────────────
+        // Verifies that a server response was genuinely produced by OUR server
+        // and not spoofed by a proxy (HTTP Debugger, Fiddler, etc.)
+        std::string generate_request_nonce();
+        bool verify_response_signature(
+            const std::string& response_body,
+            const std::string& request_nonce,
+            const std::string& sig_header,
+            const std::string& nonce_header
+        );
+
         // WinHTTP session handle and configuration
         void* hSession = nullptr;
     };

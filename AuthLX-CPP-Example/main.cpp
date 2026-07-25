@@ -9,7 +9,9 @@ std::string name = skCrypt("your_application_name").decrypt();
 std::string ownerid = skCrypt("your_application_owner_id_from_dashboard").decrypt();
 std::string secret = skCrypt("your_application_secret_key_from_dashboard").decrypt();
 std::string version = skCrypt("1.0").decrypt();
-std::string url = skCrypt("https://authlx.com/api/v1/client/").decrypt();
+// v2: direct to api.authlx.com — no 307 redirect, SRP-secured endpoint
+// Old v1 URL (keep for legacy builds): "https://authlx.com/api/v1/client/"
+std::string url = skCrypt("https://api.authlx.com/api/v2/client/").decrypt();
 
 void clear() {
 #ifdef _WIN32
