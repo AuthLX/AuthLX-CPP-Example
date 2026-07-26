@@ -402,8 +402,14 @@ namespace AuthLX {
         }
 
         // 2. Recompute expected HMAC locally.
-        // Must match the server's canonical serialization: body + ":" + nonce.
-        std::string payload = response_body + ":" + request_nonce;
+        // Must match the server's canonical serialization: sorted-key JSON body + ":" + nonce.
+        std::string canonical_body;
+        try {
+            canonical_body = nlohmann::json::parse(response_body).dump();
+        } catch (...) {
+            canonical_body = response_body;
+        }
+        std::string payload = canonical_body + ":" + request_nonce;
         std::string expected_sig = hmac_sha256(client_secret, payload);
 
         if (expected_sig.empty()) {
@@ -422,6 +428,11 @@ namespace AuthLX {
         }
         if (diff != 0) {
             LOG_ERROR("[SRP] *** SIGNATURE MISMATCH! Response has been tampered or spoofed. ***");
+            LOG_ERROR("[SRP] client_secret: " << client_secret);
+            LOG_ERROR("[SRP] payload: " << payload);
+            LOG_ERROR("[SRP] expected_sig: " << expected_sig);
+            LOG_ERROR("[SRP] sig_header: " << sig_header);
+            LOG_ERROR("[SRP] nonce_header: " << nonce_header);
             return false;
         }
 
@@ -1011,6 +1022,7 @@ namespace AuthLX {
     }
 
     nlohmann::json Api::do_request(std::string endpoint, nlohmann::json post_data) {
+        nlohmann::json response_json = nullptr;
         std::wstring host, path_prefix;
         INTERNET_PORT port;
         parse_url(api_url, host, path_prefix, port);
@@ -1109,6 +1121,7 @@ namespace AuthLX {
                 PCCERT_CHAIN_CONTEXT pChainContext = NULL;
                 bool pin_matched = false;
 
+                std::vector<std::string> actual_hashes;
                 if (CertGetCertificateChain(HCCE_CURRENT_USER, pCertContext, NULL, pCertContext->hCertStore, &chainPara, 0, NULL, &pChainContext)) {
                     
                     // Loop through the certificate chain (Leaf -> Intermediate -> Root)
@@ -1127,6 +1140,7 @@ namespace AuthLX {
                                     sprintf_s(hexBuf, "%02x", hashBuf[j]);
                                     actual_hash += hexBuf;
                                 }
+                                actual_hashes.push_back(actual_hash);
                                 
                                 // Check if this hash is in our allowed list
                                 if (std::find(pinned_cert_hashes.begin(), pinned_cert_hashes.end(), actual_hash) != pinned_cert_hashes.end()) {
@@ -1145,6 +1159,9 @@ namespace AuthLX {
                     WinHttpCloseHandle(hRequest);
                     WinHttpCloseHandle(hConnect);
                     LOG_ERROR("[SECURITY] TLS Certificate Chain Pinning FAILED! MITM Detected.");
+                    for (const auto& h : actual_hashes) {
+                        LOG_ERROR("[SECURITY] Chain Cert Hash: " << h);
+                    }
                     ExitProcess(1); // Hard terminate
                 }
             } else {
