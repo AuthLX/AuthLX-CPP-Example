@@ -3,6 +3,11 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
+# Ignored sibling repositories
+/AuthLX-CSharp-Example/
+/AuthLX-Python-Example/
+/Fake lags IMGUI/
+
 # User-specific files
 *.rsuser
 *.suo
