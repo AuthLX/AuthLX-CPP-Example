@@ -9,6 +9,7 @@
 #include <map>
 #include <iostream>
 #include "json.hpp"
+#include "ed25519.hpp"
 
 namespace AuthLX {
 
@@ -44,6 +45,7 @@ namespace AuthLX {
         std::string ownerid;
         std::string version;
         std::string client_secret;
+        std::string public_key;
         std::string hash_to_check;
         std::string api_url;
         std::string session_token;
@@ -68,7 +70,8 @@ namespace AuthLX {
             std::string version,
             std::string client_secret = "",
             std::string hash_to_check = "",
-            std::string api_url = "");
+            std::string api_url = "",
+            std::string public_key = "");
 
         ~Api();
 
@@ -176,8 +179,10 @@ namespace AuthLX {
         bool verify_response_signature(
             const std::string& response_body,
             const std::string& request_nonce,
-            const std::string& sig_header,
-            const std::string& nonce_header
+            const std::string& sig_ed25519,
+            const std::string& ts_header,
+            const std::string& nonce_header,
+            const std::string& sig_hmac
         );
 
         // WinHTTP session handle and configuration

@@ -15,6 +15,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "user32.lib")
 
 namespace AuthLX {
 
@@ -207,14 +208,16 @@ namespace AuthLX {
 
     // ─── Constructor & Destructor ────────────────────────────────────────────
 
-    Api::Api(std::string name, std::string ownerid, std::string version, std::string client_secret, std::string hash_to_check, std::string api_url)
-        : name(name), ownerid(ownerid), version(version), client_secret(client_secret), api_url(api_url) {
+    Api::Api(std::string name, std::string ownerid, std::string version, std::string client_secret, std::string hash_to_check, std::string api_url, std::string public_key)
+        : name(name), ownerid(ownerid), version(version), client_secret(client_secret), public_key(public_key), api_url(api_url) {
 
-        // Default to v2 (Signed Response Protocol secured) direct API endpoint.
-        // If the caller explicitly passes a URL, honour it (backward compat for
-        // anyone who compiled with a custom url= argument pointing at v1).
+        // Default API endpoint: v3 if public_key provided (Asymmetric Ed25519), else v2 (HMAC).
         if (this->api_url.empty()) {
-            this->api_url = "https://api.authlx.com/api/v2/client";
+            if (!this->public_key.empty()) {
+                this->api_url = "https://api.authlx.com/api/v3/client";
+            } else {
+                this->api_url = "https://api.authlx.com/api/v2/client";
+            }
         }
 
         while (!this->api_url.empty() && this->api_url.back() == '/') {
@@ -235,8 +238,9 @@ namespace AuthLX {
         }
 
         // Initialize WinHTTP Session with direct access (ignores system proxy - Anti-MITM)
+        LPCWSTR user_agent = !this->public_key.empty() ? L"AuthLX-SDK-CPP/3.0" : L"AuthLX-SDK-CPP/2.0";
         hSession = WinHttpOpen(
-            L"AuthLX-SDK-CPP/2.0",
+            user_agent,
             WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME,
             WINHTTP_NO_PROXY_BYPASS,
@@ -398,72 +402,109 @@ namespace AuthLX {
     bool Api::verify_response_signature(
         const std::string& response_body,
         const std::string& request_nonce,
-        const std::string& sig_header,
-        const std::string& nonce_header
+        const std::string& sig_ed25519,
+        const std::string& ts_header,
+        const std::string& nonce_header,
+        const std::string& sig_hmac
     ) {
-        // ── Missing headers logic ─────────────────────────────────────────────
-        // v2 server ALWAYS signs when client_secret is configured.
-        // If headers are absent but we have a secret: something stripped them → ATTACK.
-        // If no secret configured: unsigned mode is acceptable (opt-in).
-        if (sig_header.empty() || nonce_header.empty()) {
-            if (!client_secret.empty()) {
-                LOG_ERROR("[SRP] *** CRITICAL: Signature headers missing on secret-enabled app. "
-                          "Possible header-stripping MITM attack. ***");
-                return false;  // Hard fail
+        // ── Mode 1: v3 Asymmetric Ed25519 Signature Verification (Zero-Secret Mode) ─
+        if (!public_key.empty()) {
+            if (sig_ed25519.empty() || nonce_header.empty()) {
+                LOG_ERROR("[SRP v3] *** CRITICAL: Ed25519 signature headers missing on protected app. "
+                          "Possible header-stripping proxy attack. ***");
+                return false;
             }
-            // No secret configured — unsigned mode, skip verification
+
+            // 1. Nonce Echo Check: Prevents replay attacks
+            if (nonce_header != request_nonce) {
+                LOG_ERROR("[SRP v3] *** NONCE MISMATCH! Expected: " << request_nonce
+                          << " | Got: " << nonce_header << " ***");
+                return false;
+            }
+
+            // 2. Timestamp freshness verification (optional sanity check)
+            if (!ts_header.empty()) {
+                try {
+                    long long server_ts = std::stoll(ts_header);
+                    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    long long drift = std::abs((long long)now - server_ts);
+                    if (drift > 600) { // 10 minute tolerance for client-server clock drift
+                        LOG_ERROR("[SRP v3] *** TIMESTAMP DRIFT EXCEEDED (" << drift << "s). ***");
+                        return false;
+                    }
+                } catch (...) {}
+            }
+
+            // 3. Fast Canonical JSON reconstruction
+            std::string canonical_body;
+            try {
+                canonical_body = nlohmann::json::parse(response_body).dump();
+            } catch (...) {
+                canonical_body = response_body;
+            }
+
+            // Payload signed by server: `${timestamp}:${nonce}:${canonical_json}`
+            std::string payload = ts_header.empty()
+                ? (request_nonce + ":" + canonical_body)
+                : (ts_header + ":" + request_nonce + ":" + canonical_body);
+
+            bool ok = Crypto::Ed25519::verify_ed25519_signature(sig_ed25519, payload, public_key);
+            if (!ok) {
+                LOG_ERROR("[SRP v3] *** ED25519 SIGNATURE MISMATCH! Response tampered or spoofed. ***");
+                return false;
+            }
+
             if (debug) {
-                LOG_DEBUG("[SRP] No signature headers and no secret — unsigned mode, skipping.");
+                LOG_DEBUG("[SRP v3] Ed25519 signature verified OK. Nonce: " << request_nonce.substr(0, 8) << "...");
             }
             return true;
         }
 
-        // 1. Verify nonce echo — prevents stored-response replay attacks.
-        // A response captured at T=0 cannot be used at T=1 because nonces differ.
-        if (nonce_header != request_nonce) {
-            LOG_ERROR("[SRP] *** NONCE MISMATCH! Expected: " << request_nonce
-                      << " | Got: " << nonce_header << " ***");
-            LOG_ERROR("[SRP] Response replay or spoofing attempt DETECTED.");
-            return false;
+        // ── Mode 2: Legacy v2 Symmetric HMAC-SHA256 Verification ────────────────────
+        if (!client_secret.empty()) {
+            if (sig_hmac.empty() || nonce_header.empty()) {
+                LOG_ERROR("[SRP v2] *** CRITICAL: HMAC signature headers missing. ***");
+                return false;
+            }
+
+            if (nonce_header != request_nonce) {
+                LOG_ERROR("[SRP v2] *** NONCE MISMATCH! Expected: " << request_nonce
+                          << " | Got: " << nonce_header << " ***");
+                return false;
+            }
+
+            std::string canonical_body;
+            try {
+                canonical_body = nlohmann::json::parse(response_body).dump();
+            } catch (...) {
+                canonical_body = response_body;
+            }
+            std::string payload = canonical_body + ":" + request_nonce;
+            std::string expected_sig = hmac_sha256(client_secret, payload);
+
+            if (expected_sig.empty() || expected_sig.size() != sig_hmac.size()) {
+                LOG_ERROR("[SRP v2] *** SIGNATURE LENGTH MISMATCH ***");
+                return false;
+            }
+            int diff = 0;
+            for (size_t i = 0; i < expected_sig.size(); ++i) {
+                diff |= (expected_sig[i] ^ sig_hmac[i]);
+            }
+            if (diff != 0) {
+                LOG_ERROR("[SRP v2] *** HMAC SIGNATURE MISMATCH! ***");
+                return false;
+            }
+
+            if (debug) {
+                LOG_DEBUG("[SRP v2] HMAC signature verified OK. Nonce: " << request_nonce.substr(0, 8) << "...");
+            }
+            return true;
         }
 
-        // 2. Recompute expected HMAC locally.
-        // Must match the server's canonical serialization: sorted-key JSON body + ":" + nonce.
-        std::string canonical_body;
-        try {
-            canonical_body = nlohmann::json::parse(response_body).dump();
-        } catch (...) {
-            canonical_body = response_body;
-        }
-        std::string payload = canonical_body + ":" + request_nonce;
-        std::string expected_sig = hmac_sha256(client_secret, payload);
-
-        if (expected_sig.empty()) {
-            LOG_ERROR("[SRP] Failed to compute local HMAC — BCrypt error.");
-            return false;
-        }
-
-        // 3. Constant-time comparison — prevents timing side-channel attacks.
-        if (expected_sig.size() != sig_header.size()) {
-            LOG_ERROR("[SRP] *** SIGNATURE LENGTH MISMATCH — spoofing attempt. ***");
-            return false;
-        }
-        int diff = 0;
-        for (size_t i = 0; i < expected_sig.size(); ++i) {
-            diff |= (expected_sig[i] ^ sig_header[i]);
-        }
-        if (diff != 0) {
-            LOG_ERROR("[SRP] *** SIGNATURE MISMATCH! Response has been tampered or spoofed. ***");
-            LOG_ERROR("[SRP] client_secret: " << client_secret);
-            LOG_ERROR("[SRP] payload: " << payload);
-            LOG_ERROR("[SRP] expected_sig: " << expected_sig);
-            LOG_ERROR("[SRP] sig_header: " << sig_header);
-            LOG_ERROR("[SRP] nonce_header: " << nonce_header);
-            return false;
-        }
-
+        // ── Mode 3: Unsigned dev mode (neither public_key nor secret configured) ────
         if (debug) {
-            LOG_DEBUG("[SRP] Response signature verified OK. Nonce: " << request_nonce.substr(0, 8) << "...");
+            LOG_DEBUG("[SRP] Unsigned mode, skipping response verification.");
         }
         return true;
     }
@@ -1107,7 +1148,7 @@ namespace AuthLX {
         // Each request carries a unique random nonce. The server echoes it back
         // in X-Response-Nonce (signed). Nonce mismatch = replay attack detected.
         std::string req_nonce;
-        if (!client_secret.empty()) {
+        if (!public_key.empty() || !client_secret.empty()) {
             req_nonce = generate_request_nonce();
             post_data["request_nonce"] = req_nonce;
         }
@@ -1227,20 +1268,37 @@ namespace AuthLX {
         }
 
         // ── Read SRP Response Signature Headers ───────────────────────────────
-        std::string sig_header, nonce_header;
-        if (bResults && !client_secret.empty()) {
-            WCHAR sig_buf[512] = {};
+        std::string sig_ed25519, ts_header, nonce_header, sig_hmac;
+        if (bResults && (!client_secret.empty() || !public_key.empty())) {
+            WCHAR ed_buf[512] = {};
+            WCHAR ts_buf[512] = {};
             WCHAR nonce_buf[512] = {};
-            DWORD sig_sz   = sizeof(sig_buf);
+            WCHAR hmac_buf[512] = {};
+            DWORD ed_sz    = sizeof(ed_buf);
+            DWORD ts_sz    = sizeof(ts_buf);
             DWORD nonce_sz = sizeof(nonce_buf);
+            DWORD hmac_sz  = sizeof(hmac_buf);
 
+            // Query Ed25519 headers (v3)
             WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
-                L"X-Response-Sig", sig_buf, &sig_sz, WINHTTP_NO_HEADER_INDEX);
+                L"X-Signature-Ed25519", ed_buf, &ed_sz, WINHTTP_NO_HEADER_INDEX);
             WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
-                L"X-Response-Nonce", nonce_buf, &nonce_sz, WINHTTP_NO_HEADER_INDEX);
+                L"X-Signature-Timestamp", ts_buf, &ts_sz, WINHTTP_NO_HEADER_INDEX);
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
+                L"X-Signature-Nonce", nonce_buf, &nonce_sz, WINHTTP_NO_HEADER_INDEX);
 
-            sig_header   = to_string(sig_buf);
+            // Query HMAC headers (v2 fallback)
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
+                L"X-Response-Sig", hmac_buf, &hmac_sz, WINHTTP_NO_HEADER_INDEX);
+            if (nonce_buf[0] == L'\0') {
+                WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM,
+                    L"X-Response-Nonce", nonce_buf, &nonce_sz, WINHTTP_NO_HEADER_INDEX);
+            }
+
+            sig_ed25519  = to_string(ed_buf);
+            ts_header    = to_string(ts_buf);
             nonce_header = to_string(nonce_buf);
+            sig_hmac     = to_string(hmac_buf);
         }
 
         if (bResults) {
@@ -1285,8 +1343,8 @@ namespace AuthLX {
                 // HMAC mismatch   = response body was tampered (field values changed).
                 // Missing headers = proxy stripped the SRP headers (header-stripping attack).
                 // Any failure → hard terminate. No second chances. No forged auth state.
-                if (!client_secret.empty()) {
-                    if (!verify_response_signature(resp_str, req_nonce, sig_header, nonce_header)) {
+                if (!public_key.empty() || !client_secret.empty()) {
+                    if (!verify_response_signature(resp_str, req_nonce, sig_ed25519, ts_header, nonce_header, sig_hmac)) {
                         WinHttpCloseHandle(hRequest);
                         WinHttpCloseHandle(hConnect);
                         LOG_ERROR("[SRP] *** SECURITY VIOLATION: Response integrity check FAILED. ***");

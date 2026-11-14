@@ -7,11 +7,12 @@
 
 std::string name = skCrypt("your_application_name").decrypt();
 std::string ownerid = skCrypt("your_application_owner_id_from_dashboard").decrypt();
-std::string secret = skCrypt("your_application_secret_key_from_dashboard").decrypt();
+std::string secret = skCrypt("").decrypt(); // Zero-Secret Mode (v3 Ed25519)
 std::string version = skCrypt("1.0").decrypt();
-// v2: direct to api.authlx.com — no 307 redirect, SRP-secured endpoint
-// Old v1 URL (keep for legacy builds): "https://authlx.com/api/v1/client/"
-std::string url = skCrypt("https://api.authlx.com/api/v2/client/").decrypt();
+// v3: asymmetric RFC 8032 Ed25519 response signing — zero client secrets in binary
+std::string url = skCrypt("https://api.authlx.com/api/v3/client").decrypt();
+// Production Server Ed25519 Public Key (32 bytes hex)
+std::string public_key = skCrypt("f1c773b031489f4ae17d08b7aa83b8dc9035cbf73db5c8bd8cb9cfafd234d763").decrypt();
 
 void clear() {
 #ifdef _WIN32
@@ -33,7 +34,8 @@ std::string get_input(const std::string& prompt) {
 
 void banner(AuthLX::Api& authlxapp) {
     clear();
-    std::string mode = authlxapp.client_secret.empty() ? "OFF ⚠" : "SECURE 🔒";
+    std::string mode = !authlxapp.public_key.empty() ? "ED25519 v3 🛡" :
+                       (!authlxapp.client_secret.empty() ? "HMAC v2 🔒" : "OFF ⚠");
     std::cout << "╔" << std::string(58, '=') << "╗" << std::endl;
     
     std::string title = "║  " + authlxapp.name + "  —  Powered by AuthLX";
@@ -322,7 +324,8 @@ int main() {
         version,
         secret,
         "", // hash_to_check
-        url // api_url
+        url, // api_url
+        public_key // public_key (RFC 8032 Ed25519)
     );
 
     // Optional host locking whitelist
