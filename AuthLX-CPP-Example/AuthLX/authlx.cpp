@@ -45,6 +45,32 @@ namespace AuthLX {
         return fallback;
     }
 
+    // Anti-MITM: Verify Windows hosts file does not redirect authlx endpoints to localhost/loopback
+    static bool is_hosts_file_tampered() {
+        char sysDir[MAX_PATH] = {};
+        if (GetSystemDirectoryA(sysDir, MAX_PATH) == 0) return false;
+        std::string hostsPath = std::string(sysDir) + "\\drivers\\etc\\hosts";
+        std::ifstream file(hostsPath);
+        if (!file.is_open()) return false;
+
+        std::string line;
+        while (std::getline(file, line)) {
+            size_t comment = line.find('#');
+            if (comment != std::string::npos) line.resize(comment);
+
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)::tolower(c); });
+            if (lower.find("authlx.com") != std::string::npos) {
+                if (lower.find("127.0.0.1") != std::string::npos || 
+                    lower.find("::1") != std::string::npos ||
+                    lower.find("0.0.0.0") != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // Helper: Parse URL into host and path prefix
     static void parse_url(const std::string& url, std::wstring& host, std::wstring& path_prefix, INTERNET_PORT& port) {
         URL_COMPONENTS urlComp = { 0 };
@@ -1033,6 +1059,13 @@ namespace AuthLX {
         }
         std::wstring full_path = path_prefix + wendpoint;
 
+        // Anti-MITM: Validate hosts file does not redirect authlx endpoints
+        if (is_hosts_file_tampered()) {
+            LOG_ERROR("[SECURITY] Hosts file tampering detected! 'api.authlx.com' redirected to loopback.");
+            last_message = "SECURITY: Hosts file tampering detected.";
+            ExitProcess(1);
+        }
+
         // Host Locking Validation
         if (!allowed_hosts.empty()) {
             std::string check_domain = to_string(host);
@@ -1224,6 +1257,10 @@ namespace AuthLX {
                 DWORD dwDownloaded = 0;
                 if (WinHttpReadData(hRequest, temp_buf.data(), dwSize, &dwDownloaded)) {
                     response_data.insert(response_data.end(), temp_buf.begin(), temp_buf.begin() + dwDownloaded);
+                    if (response_data.size() > 8 * 1024 * 1024) { // 8MB safety cap
+                        LOG_ERROR("[SECURITY] API response exceeded 8MB buffer limit. Aborting read.");
+                        break;
+                    }
                 }
             } while (dwSize > 0);
 
@@ -1753,13 +1790,17 @@ namespace AuthLX {
                 info.update_available = true;
             }
 
-            // Always target the Latest Mark release endpoint (/download/latest/:appName) for auto-update
-            dl_url = api_url + "/download/latest/" + name;
+            // If no direct CDN/release URL was retrieved from /file/latest or /init, target the latest release endpoint
+            if (dl_url.empty()) {
+                std::string target_id = ownerid.empty() ? name : ownerid;
+                dl_url = api_url + "/download/latest/" + target_id;
+            }
 
             info.download_url = dl_url;
         } catch (const std::exception& e) {
             LOG_ERROR("[AUTO-UPDATE] Exception in check_for_updates: " << e.what());
-            info.download_url = api_url + "/download/latest/" + name;
+            std::string target_id = ownerid.empty() ? name : ownerid;
+            info.download_url = api_url + "/download/latest/" + target_id;
             info.update_available = true;
         }
 
@@ -1886,7 +1927,7 @@ namespace AuthLX {
             LOG_WARN("[AUTO-UPDATE] File download failed or not found! Waiting 10 seconds before final retry attempt...");
             Sleep(10000);
 
-            std::string latest_fallback = api_url + "/download/latest/" + name;
+            std::string latest_fallback = api_url + "/download/latest/" + (ownerid.empty() ? name : ownerid);
             LOG_INFO("[AUTO-UPDATE] Retrying final download attempt from: " << latest_fallback);
             download_ok = download_file_winhttp(latest_fallback, current_exe);
         }
